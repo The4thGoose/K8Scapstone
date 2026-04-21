@@ -1,0 +1,575 @@
+---
+- hosts: primary
+  become: true
+  tasks:
+
+    # Prep Work
+    - name: Disable firewall for testing only
+      command: systemctl disable --now ufw
+      ignore_errors: true
+      run_once: true
+      changed_when: false
+
+    - name: Disable swap right now
+      command: swapoff -a
+
+    - name: Disable swap in fstab so it stays off after reboot
+      replace:
+        path: /etc/fstab
+        regexp: '^(?!#)(.*\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: Reboot after swap change
+      reboot:
+
+    - name: Install APT packages needed for repositories
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: true
+
+    # Docker Install
+    - name: Add Docker apt key
+      command: "{{ item }}"
+      with_items: 
+        - "curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc"
+        - "chmod a+r /etc/apt/keyrings/docker.asc"
+
+    - name: Create docker.sources file
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        content: |
+          Types: deb
+          URIs: https://download.docker.com/linux/debian
+          Suites: trixie
+          Components: stable
+          Architectures: amd64
+          Signed-By: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+
+    - name: Install Docker and container runtime packages
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Make sure Docker config folder exists
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Delete /etc/containerd/config.toml # Maybe this file already exists?
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Create default containerd config if missing # why is this not running...
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Wait 3 seconds # I hope this fixes things
+      pause:
+        seconds: 3
+
+    - name: Set containerd to use systemd cgroups
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Wait 3 seconds again
+      pause:
+        seconds: 3
+
+    - name: Enable and start Docker service
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Enable and start containerd service
+      service:
+        name: containerd
+        state: started
+        enabled: true
+
+    - name: Restart the containerd service # for sanity's sake
+      service:
+        name: containerd
+        state: restarted
+
+    - name: Add administrator user to docker group
+      user:
+        name: administrator
+        groups: docker
+        append: true
+
+    - name: Load kernel modules needed by Kubernetes
+      command: "modprobe {{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: false
+
+    - name: Make kernel module loading persistent
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    # Install K8S
+    - name: Download and dearmor GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    
+    - name: Set permissions
+      command: "chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+
+    - name: Add Kubernetes apt repository
+      shell: "{{ item }}"
+      with_items:
+        - "echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list"
+        - "chmod 644 /etc/apt/sources.list.d/kubernetes.list"
+
+    - name: Install kubeadm, kubelet and kubectl
+      apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+        update_cache: true
+
+    - name: Enable and start kubelet
+      service:
+        name: kubelet
+        state: started
+        enabled: true
+
+    - name: Create k8s sysctl file
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        mode: '0644'
+
+    - name: Apply sysctl settings
+      command: sysctl --system
+      changed_when: false
+
+    # The actual K8S deployment
+    - name: Initialize Kubernetes control plane
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/administrator.conf
+      register: kubeadm_output
+
+    - name: Create .kube folder for administrator
+      file:
+        path: /home/administrator/.kube
+        state: directory
+        owner: administrator
+        group: administrator
+        mode: '0755'
+
+    - name: Copy admin.conf for kubectl
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/administrator/.kube/config
+        owner: administrator
+        group: administrator
+        mode: '0600'
+        remote_src: true
+    
+    - name: Remove the "control-panel" taint from all nodes # fixes traefik and argocd not starting consistently
+                                                            # not technically good practice
+      command: kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+      become_user: administrator
+
+    - name: Install Flannel network plugin
+      command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      register: flannel_apply
+      changed_when: "'created' in flannel_apply.stdout or 'configured' in flannel_apply.stdout"
+
+    - name: Create argocd namespace
+      command: kubectl create namespace argocd
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      register: argocd_namespace_create
+      failed_when: argocd_namespace_create.rc != 0 and 'AlreadyExists' not in argocd_namespace_create.stderr
+      changed_when: "'created' in argocd_namespace_create.stdout"
+
+    - name: Install Argo CD
+      command: kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      register: argocd_apply
+      changed_when: "'created' in argocd_apply.stdout or 'configured' in argocd_apply.stdout"
+
+    - name: Install Helm
+      shell: curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        executable: /bin/bash
+
+    - name: Add Traefik Helm repo
+      command: helm repo add traefik https://traefik.github.io/charts
+      become_user: administrator
+      register: traefik_repo_add
+      failed_when: traefik_repo_add.rc != 0 and 'already exists' not in traefik_repo_add.stderr
+      changed_when: "'has been added' in traefik_repo_add.stdout"
+
+    - name: Update Helm repositories
+      command: helm repo update
+      become_user: administrator
+      changed_when: false
+
+    - name: Install Traefik ingress controller
+      command: >
+        helm upgrade --install traefik traefik/traefik   
+        --namespace kube-system 
+        --set providers.kubernetesCRD.enabled=true 
+        --set providers.kubernetesIngress.enabled=true 
+        --set service.type=NodePort
+        --set ports.web.nodePort=30080
+        --set ports.websecure.nodePort=30443
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      register: traefik_apply
+      changed_when: "'STATUS: deployed' in traefik_apply.stdout or 'STATUS: upgraded' in traefik_apply.stdout"
+
+    - name: Wait for Traefik deployment to be ready
+      command: kubectl -n kube-system rollout status deployment/traefik --timeout=180s
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      changed_when: false
+
+#    # MetalLB Installation for LoadBalancer support
+#    - name: Install MetalLB
+#      command: kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/config/manifests/metallb-native.yaml
+#      become_user: administrator
+#      environment:
+#        KUBECONFIG: /home/administrator/.kube/config
+#      register: metallb_apply
+#      changed_when: "'created' in metallb_apply.stdout or 'configured' in metallb_apply.stdout"
+#
+#    - name: Wait for MetalLB to be ready
+#      command: kubectl -n metallb-system rollout status deployment/controller --timeout=180s
+#      become_user: administrator
+#      environment:
+#        KUBECONFIG: /home/administrator/.kube/config
+#      changed_when: false
+#
+#    - name: Configure MetalLB IP Address Pool
+#      shell: |
+#        cat <<'EOF' | kubectl apply -f -
+#        apiVersion: metallb.io/v1beta1
+#        kind: IPAddressPool
+#        metadata:
+#          name: default
+#          namespace: metallb-system
+#        spec:
+#          addresses:
+#          - 192.168.0.246/24
+#        EOF
+#      args:
+#        executable: /bin/bash
+#      become_user: administrator
+#      environment:
+#        KUBECONFIG: /home/administrator/.kube/config
+#      register: metallb_pool_apply
+#      changed_when: "'created' in metallb_pool_apply.stdout or 'configured' in metallb_pool_apply.stdout"
+#
+#    - name: Configure MetalLB L2 Advertisement
+#      shell: |
+#        cat <<'EOF' | kubectl apply -f -
+#        apiVersion: metallb.io/v1beta1
+#        kind: L2Advertisement
+#        metadata:
+#          name: default
+#          namespace: metallb-system
+#        spec:
+#          ipAddressPools:
+#          - default
+#        EOF
+#      args:
+#        executable: /bin/bash
+#      become_user: administrator
+#      environment:
+#        KUBECONFIG: /home/administrator/.kube/config
+#      register: metallb_l2_apply
+#      changed_when: "'created' in metallb_l2_apply.stdout or 'configured' in metallb_l2_apply.stdout"
+
+    - name: Wait for Argo CD application controller to be ready
+      command: kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      changed_when: false
+
+    - name: wait 30s
+      pause:
+        seconds: 30
+
+    - name: Deploy filestore Argo CD application
+      shell: |
+        cat <<'EOF' | kubectl apply -f -
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: filestore
+          namespace: argocd
+        spec:
+          project: default
+          source:
+            repoURL: http://git.dexidevs.net/kpwenzel/K8Scapstone
+            targetRevision: main
+            path: Application/k8s
+            kustomize:
+              images:
+                - kpwenzel/filestore-app=kpwenzel/filestore-app:latest
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: filestore
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+        EOF
+      args:
+        executable: /bin/bash
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      register: filestore_app_apply
+      changed_when: "'created' in filestore_app_apply.stdout or 'configured' in filestore_app_apply.stdout"
+
+    - name: Wait for filestore app to become synced and healthy
+      command: kubectl -n argocd get application filestore -o jsonpath='{.status.sync.status} {.status.health.status}'
+      become_user: administrator
+      environment:
+        KUBECONFIG: /home/administrator/.kube/config
+      register: filestore_app_status
+      until: "'Synced Healthy' in filestore_app_status.stdout"
+      retries: 60
+      delay: 10
+      changed_when: false
+
+    - name: Get kubeadm join command for workers
+      command: kubeadm token create --print-join-command
+      register: kube_join_cmd_raw
+      changed_when: false
+
+    - name: Save join command as host fact
+      set_fact:
+        kube_join_command: "{{ kube_join_cmd_raw.stdout }}"
+
+- hosts: workers
+  become: true
+  tasks:
+    - name: Disable firewall for testing only
+      command: systemctl disable --now ufw
+      ignore_errors: true
+      changed_when: false
+
+    - name: Disable swap right now
+      command: swapoff -a
+
+    - name: Disable swap in fstab so it stays off after reboot
+      replace:
+        path: /etc/fstab
+        regexp: '^(?!#)(.*\sswap\s+.*)$'
+        replace: '# \1'
+
+    - name: Reboot after swap change
+      reboot:
+
+    - name: Install APT packages needed for repositories
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: true
+
+    - name: Add Docker apt key
+      command: "{{ item }}"
+      with_items: 
+        - "curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc"
+        - "chmod a+r /etc/apt/keyrings/docker.asc"
+
+    - name: Create docker.sources file
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        content: |
+          Types: deb
+          URIs: https://download.docker.com/linux/debian
+          Suites: trixie
+          Components: stable
+          Architectures: amd64
+          Signed-By: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+
+    - name: Install Docker and container runtime packages
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Make sure Docker config folder exists
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Delete /etc/containerd/config.toml # Maybe this file already exists?
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Create default containerd config if missing # why is this not running...
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Wait 3 seconds # I hope this fixes things
+      pause:
+        seconds: 3
+
+    - name: Set containerd to use systemd cgroups
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Wait 3 seconds again
+      pause:
+        seconds: 3
+
+    - name: Enable and start Docker service
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Enable and start containerd service
+      service:
+        name: containerd
+        state: started
+        enabled: true
+
+    - name: Restart the containerd service # for sanity's sake
+      service:
+        name: containerd
+        state: restarted
+
+    - name: Add administrator user to docker group
+      user:
+        name: administrator
+        groups: docker
+        append: true
+
+    - name: Load kernel modules needed by Kubernetes
+      command: "modprobe {{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: false
+
+    - name: Make kernel module loading persistent
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Download and dearmor GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key | \
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    
+    - name: Set permissions
+      command: "chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+
+    - name: Add Kubernetes apt repository
+      shell: "{{ item }}"
+      with_items:
+        - "echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /' | tee /etc/apt/sources.list.d/kubernetes.list"
+        - "chmod 644 /etc/apt/sources.list.d/kubernetes.list"
+
+    - name: Install kubeadm, kubelet and kubectl
+      apt:
+        name:
+          - kubeadm
+          - kubelet
+          - kubectl
+        state: present
+        update_cache: true
+
+    - name: Enable and start kubelet
+      service:
+        name: kubelet
+        state: started
+        enabled: true
+
+    - name: Create k8s sysctl file
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        mode: '0644'
+
+    - name: Apply sysctl settings
+      command: sysctl --system
+      changed_when: false
+
+    - name: Join worker to the cluster
+      command: "{{ hostvars[groups['primary'][0]].kube_join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
