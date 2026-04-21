@@ -350,7 +350,7 @@
         spec:
           project: default
           source:
-            repoURL: http://git.dexidevs.net/kpwenzel/K8Scapstone
+            repoURL: https://github.com/The4thGoose/K8Scapstone
             targetRevision: main
             path: Application/k8s
             kustomize:
